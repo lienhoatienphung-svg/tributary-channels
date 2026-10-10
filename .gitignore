@@ -54,3 +54,6 @@ scripts/create_issues.py
 
 # ─── Persistent username store (Issue #1056) ────────────────────────────────
 backend/data/
+branch_structure.json
+temp_auto_push.bat
+temp_interactive_push.bat
