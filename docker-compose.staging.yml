@@ -38,7 +38,7 @@ services:
       - proxy
 
   frontend:
-    image: ghcr.io/chidubemkingsley/stellar-micropay-frontend:staging
+    image: ghcr.io/${IMAGE_OWNER:-chidubemkingsley}/stellar-micropay-frontend:${STAGING_IMAGE_TAG:-staging}
     volumes:
       - frontend_static:/usr/share/nginx/html
     environment:
@@ -56,7 +56,7 @@ services:
       - frontend
 
   backend:
-    image: ghcr.io/chidubemkingsley/stellar-micropay-backend:staging
+    image: ghcr.io/${IMAGE_OWNER:-chidubemkingsley}/stellar-micropay-backend:${STAGING_IMAGE_TAG:-staging}
     environment:
       - PORT=4000
       - NODE_ENV=staging

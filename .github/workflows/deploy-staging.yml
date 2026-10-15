@@ -19,6 +19,8 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      deployed_tag: ${{ steps.record_tag.outputs.deployed_tag }}
 
     strategy:
       matrix:
@@ -67,6 +69,12 @@ jobs:
             SENTRY_PROJECT=${{ secrets.SENTRY_PROJECT }}
             SENTRY_RELEASE=${{ github.sha }}
 
+      - name: Record deployed staging tag
+        id: record_tag
+        run: |
+          SHORT_SHA="${GITHUB_SHA::7}"
+          echo "deployed_tag=staging-${SHORT_SHA}" >> "$GITHUB_OUTPUT"
+
   smoke-test:
     name: Staging smoke tests
     needs: deploy-staging
@@ -94,53 +102,99 @@ jobs:
 
   rollback-on-failure:
     name: Automatic rollback on failure
-    needs: smoke-test
+    needs: [deploy-staging, smoke-test]
     if: failure()
     runs-on: ubuntu-latest
     permissions:
       contents: read
-      packages: read
+      packages: write
+      issues: write
 
     steps:
       - name: Checkout
         uses: actions/checkout@v4
 
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
       - name: Determine previous staging image
         id: previous
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          DEPLOYED_TAG: ${{ needs.deploy-staging.outputs.deployed_tag }}
         run: |
-          # Get the second-most-recent staging image tag (previous deployment)
-          PREV_TAG=$(docker manifest inspect \
-            ghcr.io/${{ github.repository_owner }}/stellar-micropay-backend:staging 2>/dev/null \
-            | jq -r '.manifests[1].digest' 2>/dev/null || echo "")
-          if [ -z "$PREV_TAG" ]; then
-            echo "No previous staging image found for rollback"
-            echo "rollback_needed=false" >> $GITHUB_OUTPUT
-          else
-            echo "rollback_needed=true" >> $GITHUB_OUTPUT
-            echo "previous_tag=$PREV_TAG" >> $GITHUB_OUTPUT
+          set -euo pipefail
+          CURRENT_TAG="${DEPLOYED_TAG:-staging-${GITHUB_SHA::7}}"
+          echo "Current failed deployment tag: ${CURRENT_TAG}"
+
+          # Resolve ordered staging-<sha> tags from the package version list
+          # (org package endpoint with user package fallback) rather than
+          # indexing multi-platform manifest entries.
+          VERSIONS_JSON=$(gh api "/orgs/${OWNER}/packages/container/stellar-micropay-backend/versions?per_page=50" 2>/dev/null \
+            || gh api "/users/${OWNER}/packages/container/stellar-micropay-backend/versions?per_page=50" 2>/dev/null \
+            || echo "[]")
+
+          PREV_TAG=$(printf '%s' "${VERSIONS_JSON}" | jq -r --arg cur "${CURRENT_TAG}" '
+            [ .[]?
+              | (.metadata.container.tags // [])[]
+              | select(test("^staging-[0-9a-f]{7,40}$"))
+              | select(. != $cur)
+            ] | first // empty
+          ')
+
+          if [ -z "${PREV_TAG}" ]; then
+            echo "::error::Cannot determine a previous staging-<sha> tag (excluding ${CURRENT_TAG}); aborting rollback."
+            exit 1
           fi
 
-      - name: Trigger rollback
-        if: steps.previous.outputs.rollback_needed == 'true'
-        run: |
-          echo "::error::Smoke tests failed. Rolling back staging deployment."
-          echo "::error::Previous image: ${{ steps.previous.outputs.previous_tag }}"
-          # Rollback is achieved by re-deploying the previous staging-{sha} tag
-          # The actual rollback command depends on your deployment platform:
-          # - For docker compose: docker compose -f docker-compose.staging.yml up -d --force-recreate
-          # - For Kubernetes: kubectl rollout undo deployment/staging
-          # - For ECS: aws ecs update-service --force-new-deployment
-          echo "Rollback initiated. Manual intervention may be required."
+          echo "Resolved previous staging tag: ${PREV_TAG}"
+          echo "deployed_tag=${CURRENT_TAG}" >> "$GITHUB_OUTPUT"
+          echo "previous_tag=${PREV_TAG}" >> "$GITHUB_OUTPUT"
 
-      - name: Notify failure
-        if: steps.previous.outputs.rollback_needed == 'true'
+      - name: Redeploy previous staging tag
+        id: rollback
+        env:
+          IMAGE_OWNER: ${{ github.repository_owner }}
+          STAGING_IMAGE_TAG: ${{ steps.previous.outputs.previous_tag }}
+        run: |
+          set -euo pipefail
+          echo "::warning::Smoke tests failed for ${{ steps.previous.outputs.deployed_tag }}. Redeploying ${STAGING_IMAGE_TAG} via docker-compose.staging.yml."
+          for IMAGE in stellar-micropay-backend stellar-micropay-frontend; do
+            docker buildx imagetools create \
+              -t "${REGISTRY}/${IMAGE_OWNER}/${IMAGE}:staging" \
+              "${REGISTRY}/${IMAGE_OWNER}/${IMAGE}:${STAGING_IMAGE_TAG}"
+          done
+          docker compose -f docker-compose.staging.yml pull frontend backend
+          docker compose -f docker-compose.staging.yml up -d --force-recreate
+
+      - name: Notify rollback status
+        if: always()
         uses: actions/github-script@v7
         with:
           script: |
-            github.rest.issues.create({
+            const deployedTag = '${{ steps.previous.outputs.deployed_tag }}' || `staging-${context.sha.slice(0, 7)}`;
+            const previousTag = '${{ steps.previous.outputs.previous_tag }}';
+            const previousOutcome = '${{ steps.previous.outcome }}';
+            const rollbackOutcome = '${{ steps.rollback.outcome }}';
+            const rolledBack = previousOutcome === 'success' && rollbackOutcome === 'success' && Boolean(previousTag);
+
+            const title = rolledBack
+              ? `[Rollback] Staging rolled back to ${previousTag} after smoke-test failure (${deployedTag})`
+              : `[Rollback Failed] Staging smoke tests failed and automatic rollback did not complete (${deployedTag})`;
+
+            const actionSummary = rolledBack
+              ? `Smoke tests failed for \`${deployedTag}\`. Automatic rollback re-tagged \`${previousTag}\` as \`:staging\` and redeployed it with \`docker compose -f docker-compose.staging.yml up -d --force-recreate\`.`
+              : `Smoke tests failed for \`${deployedTag}\`, and automatic rollback could not complete (previous-tag lookup: \`${previousOutcome}\`, redeploy step: \`${rollbackOutcome}\`, resolved tag: \`${previousTag || 'none'}\`). Manual intervention is required.`;
+
+            await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `[Rollback] Staging deployment failed smoke tests — ${context.sha}`,
-              body: `## Automatic Rollback Triggered\n\nCommit: ${context.sha}\nWorkflow: ${context.workflow}\nRun: ${context.runId}\n\nSmoke tests failed after deployment. The staging environment has been rolled back to the previous stable image.\n\n### Rollback Criteria\n- Health endpoint non-responsive\n- API documentation unreachable\n- Security headers missing\n- Network isolation violation\n\nPlease investigate before re-deploying.`,
+              title,
+              body: `## Staging Smoke-Test Failure & Rollback Report\n\nCommit: ${context.sha}\nDeployed Tag: ${deployedTag}\nPrevious Tag: ${previousTag || 'unresolved'}\nRollback Status: ${rolledBack ? 'Succeeded' : 'Failed'}\nWorkflow: ${context.workflow}\nRun: ${context.runId}\n\n${actionSummary}\n\n### Smoke-Test Checks\n- Health endpoint responsiveness\n- API documentation reachability\n- Security headers presence\n- Network isolation verification`,
               labels: ["incident", "rollback", "staging"]
             });
