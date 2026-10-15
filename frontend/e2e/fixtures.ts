@@ -10,7 +10,7 @@ export const test = base.extend<{
 
   page: async ({ page, walletState }, use) => {
     // --- Horizon (Stellar network) ---
-    await page.route('**/horizon.stellar.org/**', route => {
+    await page.route('**/horizon*.stellar.org/**', route => {
       const url = route.request().url();
       if (url.includes('/accounts/')) {
         const balance =
@@ -82,21 +82,19 @@ export const test = base.extend<{
     // --- Backend auth API mocks ---
     await page.route('**/api/auth**', route => {
       if (route.request().method() === 'GET') {
-        // GET /api/auth?account=... returns challenge transaction
         route.fulfill({
           status: 200,
           contentType: 'application/json',
           body: JSON.stringify({
-            transaction: 'AAAAAgAAAAD8...mock_challenge_xdr' // mock XDR
+            transaction: 'AAAAAgAAAAD8...mock_challenge_xdr',
           }),
         });
       } else if (route.request().method() === 'POST') {
-        // POST /api/auth with signed transaction returns JWT
         route.fulfill({
           status: 200,
           contentType: 'application/json',
           body: JSON.stringify({
-            token: 'mock_jwt_token'
+            token: 'mock_jwt_token',
           }),
         });
       }
@@ -112,16 +110,52 @@ export const test = base.extend<{
 
     await page.addInitScript(
       ({ publicKey }: { publicKey: string }) => {
-        // Mock the freighter-api package by overriding the module exports
-        // Since ES modules are hard to mock, we override the global freighter object
-        // that the package checks for
+        let allowed = false;
         (window as any).freighter = {
           isConnected: async () => ({ isConnected: true }),
           getPublicKey: async () => ({ publicKey }),
-          requestAccess: async () => ({}),
-          signTransaction: async (xdr: string) => ({ signedTransaction: xdr + '_signed' }),
-          isAllowed: async () => ({ isAllowed: true }),
+          requestAccess: async () => {
+            allowed = true;
+            return { publicKey, address: publicKey };
+          },
+          signTransaction: async (xdr: string) => ({
+            signedTransaction: xdr + '_signed',
+            signedTxXdr: xdr + '_signed',
+          }),
+          isAllowed: async () => ({ isAllowed: allowed }),
         };
+
+        window.addEventListener('message', (event: MessageEvent) => {
+          const data = event.data as
+            | { source?: string; type?: string; messageId?: number; transactionXdr?: string }
+            | undefined;
+          if (!data || data.source !== 'FREIGHTER_EXTERNAL_MSG_REQUEST') return;
+
+          if (data.type === 'REQUEST_ACCESS' || data.type === 'SET_ALLOWED_STATUS') {
+            allowed = true;
+          }
+
+          const signed = (data.transactionXdr || 'mock_xdr') + '_signed';
+          const responsesByType: Record<string, unknown> = {
+            REQUEST_CONNECTION_STATUS: { isConnected: true },
+            REQUEST_ALLOWED_STATUS: { isAllowed: allowed },
+            SET_ALLOWED_STATUS: { isAllowed: true },
+            REQUEST_PUBLIC_KEY: { publicKey, address: publicKey },
+            REQUEST_ACCESS: { publicKey, address: publicKey },
+            SUBMIT_TRANSACTION: { signedTransaction: signed, signedTxXdr: signed, signerAddress: publicKey },
+          };
+          const body = data.type ? responsesByType[data.type] : undefined;
+          if (!body) return;
+
+          window.postMessage(
+            {
+              source: 'FREIGHTER_EXTERNAL_MSG_RESPONSE',
+              messagedId: data.messageId,
+              ...(body as object),
+            },
+            window.location.origin,
+          );
+        });
       },
       { publicKey },
     );
