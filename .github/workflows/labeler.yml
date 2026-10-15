@@ -1,14 +1,24 @@
 name: "Pull Request Labeler"
+
+# Use pull_request instead of pull_request_target so untrusted fork PRs never
+# execute in the privileged base-repository context or receive a write-scoped
+# GITHUB_TOKEN.
 on:
-- pull_request_target
+  pull_request:
+    types: [opened, synchronize, reopened]
+
+permissions: {}
 
 jobs:
   labeler:
+    # Fork pull_request events receive a read-only GITHUB_TOKEN by platform
+    # design, so guard the label write step to same-repository pull requests.
+    if: github.event.pull_request.head.repo.full_name == github.repository
     permissions:
       contents: read
       pull-requests: write
     runs-on: ubuntu-latest
     steps:
-    - uses: actions/labeler@v5
-      with:
-        repo-token: "${{ secrets.GITHUB_TOKEN }}"
+      - uses: actions/labeler@v5
+        with:
+          repo-token: "${{ secrets.GITHUB_TOKEN }}"
